@@ -716,7 +716,7 @@ if [[ "$__RunTests" -ne 0 ]]; then
 
     echo "Run Tests..."
 
-    nextCommand="$__TestDir/runtest.sh --testRootDir=$__TestBinDir --coreClrBinDir=$__BinDir --coreFxBinDir=$CORE_ROOT --testNativeBinDir=$__testNativeBinDir"
+    nextCommand="$__TestDir/runtest.sh  $__BuildArch $__BuildType --testRootDir=$__TestBinDir --coreClrBinDir=$__BinDir --coreFxBinDir=$CORE_ROOT --testNativeBinDir=$__testNativeBinDir"
     echo "$nextCommand"
     eval $nextCommand
 
