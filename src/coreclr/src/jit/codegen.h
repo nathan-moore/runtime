@@ -261,6 +261,10 @@ protected:
 
     void genCheckOverflow(GenTree* tree);
 
+#ifdef TARGET_ARMARCH
+    void genJumpRegToThrowHlpBlk(instruction jump, SpecialCodeKind codeKind, BasicBlock* failBlk, GenTree* op1);
+#endif
+
     //-------------------------------------------------------------------------
     //
     // Prolog/epilog generation

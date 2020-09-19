@@ -1446,7 +1446,12 @@ void CodeGen::genRangeCheck(GenTree* oper)
     genConsumeRegs(arrIndex);
     genConsumeRegs(arrLen);
 
-    if (arrIndex->isContainedIntOrIImmed())
+    if (arrIndex->IsIntegralConst(0) && arrLen->isUsedFromReg())
+    {
+        genJumpRegToThrowHlpBlk(INS_cbz, bndsChk->gtThrowKind, bndsChk->gtIndRngFailBB, arrLen);
+        return;
+    }
+    else if (arrIndex->isContainedIntOrIImmed())
     {
         // To encode using a cmp immediate, we place the
         //  constant operand in the second position
@@ -1472,6 +1477,79 @@ void CodeGen::genRangeCheck(GenTree* oper)
 
     GetEmitter()->emitInsBinary(INS_cmp, emitActualTypeSize(bndsChkType), src1, src2);
     genJumpToThrowHlpBlk(jmpKind, bndsChk->gtThrowKind, bndsChk->gtIndRngFailBB);
+}
+
+//------------------------------------------------------------------------
+// genJumpRegToThrowHlpBlk: Generate code for an out-of-line exception that needs a register operand.
+//
+// Notes:
+//   For code that uses throw helper blocks, we share the helper blocks created by fgAddCodeRef().
+//   Otherwise, we generate the 'throw' inline.
+//
+// Arguments:
+//   jumpKind - jump kind to generate;
+//   codeKind - the special throw-helper kind;
+//   failBlk  - optional fail target block, if it is already known;
+//   op1      - the operand for the jump
+//
+void CodeGen::genJumpRegToThrowHlpBlk(instruction jump, SpecialCodeKind codeKind, BasicBlock* failBlk, GenTree* op1)
+{
+    assert((jump == INS_cbz) || (jump == INS_cbnz));
+    bool useThrowHlpBlk = compiler->fgUseThrowHelperBlocks();
+
+    if (useThrowHlpBlk)
+    {
+        // For code with throw helper blocks, find and use the helper block for
+        // raising the exception. The block may be shared by other trees too.
+
+        BasicBlock* excpRaisingBlock;
+
+        if (failBlk != nullptr)
+        {
+            // We already know which block to jump to. Use that.
+            excpRaisingBlock = failBlk;
+
+#ifdef DEBUG
+            Compiler::AddCodeDsc* add =
+                compiler->fgFindExcptnTarget(codeKind, compiler->bbThrowIndex(compiler->compCurBB));
+            assert(excpRaisingBlock == add->acdDstBlk);
+#if !FEATURE_FIXED_OUT_ARGS
+            assert(add->acdStkLvlInit || isFramePointerUsed());
+#endif // !FEATURE_FIXED_OUT_ARGS
+#endif // DEBUG
+        }
+        else
+        {
+            // Find the helper-block which raises the exception.
+            Compiler::AddCodeDsc* add =
+                compiler->fgFindExcptnTarget(codeKind, compiler->bbThrowIndex(compiler->compCurBB));
+            PREFIX_ASSUME_MSG((add != nullptr), ("ERROR: failed to find exception throw block"));
+            excpRaisingBlock = add->acdDstBlk;
+#if !FEATURE_FIXED_OUT_ARGS
+            assert(add->acdStkLvlInit || isFramePointerUsed());
+#endif // !FEATURE_FIXED_OUT_ARGS
+        }
+
+        noway_assert(excpRaisingBlock != nullptr);
+
+        // Jump to the exception-throwing block on error.
+        GetEmitter()->emitIns_J_R(jump, emitActualTypeSize(op1), failBlk, op1->GetRegNum());
+    }
+    else
+    {
+        // The code to throw the exception will be generated inline, and
+        //  we will jump around it in the normal non-exception case.
+
+        BasicBlock*  tgtBlk         = genCreateTempLabel();
+        instruction reverseJumpKind = (jump == INS_cbz) ? INS_cbnz : INS_cbz;
+
+        GetEmitter()->emitIns_J_R(reverseJumpKind, emitActualTypeSize(op1), failBlk, op1->GetRegNum());
+
+        genEmitHelperCall(compiler->acdHelper(codeKind), 0, EA_UNKNOWN);
+
+        // Define the spot for the normal non-exception case to jump to.
+        genDefineTempLabel(tgtBlk);
+    }
 }
 
 //---------------------------------------------------------------------
