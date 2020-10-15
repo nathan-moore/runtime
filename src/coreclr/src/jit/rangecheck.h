@@ -83,6 +83,10 @@ struct Limit
         keUnknown,   // The limit could not be determined.
     };
 
+    int       cns;
+    ValueNum  vn;
+    LimitType type;
+
     Limit() : type(keUndef)
     {
     }
@@ -101,27 +105,27 @@ struct Limit
         assert(type == keBinOpArray);
     }
 
-    bool IsUndef()
+    bool IsUndef() const
     {
         return type == keUndef;
     }
-    bool IsDependent()
+    bool IsDependent() const
     {
         return type == keDependent;
     }
-    bool IsUnknown()
+    bool IsUnknown() const
     {
         return type == keUnknown;
     }
-    bool IsConstant()
+    bool IsConstant() const
     {
         return type == keConstant;
     }
-    int GetConstant()
+    int GetConstant() const
     {
         return cns;
     }
-    bool IsBinOpArray()
+    bool IsBinOpArray() const
     {
         return type == keBinOpArray;
     }
@@ -148,7 +152,7 @@ struct Limit
         return false;
     }
 
-    bool Equals(Limit& l)
+    bool Equals(const Limit& l) const
     {
         switch (type)
         {
@@ -192,9 +196,6 @@ struct Limit
         unreached();
     }
 #endif
-    int       cns;
-    ValueNum  vn;
-    LimitType type;
 };
 
 // Range struct contains upper and lower limit.
@@ -202,13 +203,19 @@ struct Range
 {
     Limit uLimit;
     Limit lLimit;
+    bool isRecursive;
 
-    Range(const Limit& limit) : uLimit(limit), lLimit(limit)
+    Range(const Limit& limit) : uLimit(limit), lLimit(limit), isRecursive(false)
     {
     }
 
-    Range(const Limit& lLimit, const Limit& uLimit) : uLimit(uLimit), lLimit(lLimit)
+    Range(const Limit& lLimit, const Limit& uLimit) : uLimit(uLimit), lLimit(lLimit), isRecursive(false)
     {
+    }
+
+    void SetIsRecursive(bool toSet)
+    {
+        isRecursive = toSet;
     }
 
     Limit& UpperLimit()
@@ -219,6 +226,11 @@ struct Range
     Limit& LowerLimit()
     {
         return lLimit;
+    }
+
+    bool IsRecursive() const
+    {
+        return isRecursive;
     }
 
 #ifdef DEBUG
@@ -387,7 +399,7 @@ public:
     RangeCheck(Compiler* pCompiler);
 
     typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, bool>        OverflowMap;
-    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, Range*>      RangeMap;
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, Range>      RangeMap;
     typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, BasicBlock*> SearchPath;
 
 #ifdef DEBUG
@@ -454,17 +466,17 @@ public:
     // The "path" is the path taken in the search for the rhs' range and its constituents' range.
     // If "monIncreasing" is true, the calculations are made more liberally assuming initial values
     // at phi definitions for the lower bound.
-    Range GetRange(BasicBlock* block, GenTree* expr, bool monIncreasing DEBUGARG(int indent));
+    Range GetRange(GenTree* expr DEBUGARG(int indent));
 
     // Given the local variable, first find the definition of the local and find the range of the rhs.
     // Helper for GetRange.
-    Range ComputeRangeForLocalDef(BasicBlock* block, GenTreeLclVarCommon* lcl, bool monIncreasing DEBUGARG(int indent));
+    Range ComputeRangeForLocalDef(GenTreeLclVarCommon* lcl DEBUGARG(int indent));
 
     // Compute the range, rather than retrieve a cached value. Helper for GetRange.
-    Range ComputeRange(BasicBlock* block, GenTree* expr, bool monIncreasing DEBUGARG(int indent));
+    Range ComputeRange(GenTree* expr, bool widen DEBUGARG(int indent));
 
     // Compute the range for the op1 and op2 for the given binary operator.
-    Range ComputeRangeForBinOp(BasicBlock* block, GenTreeOp* binop, bool monIncreasing DEBUGARG(int indent));
+    Range ComputeRangeForBinOp(GenTreeOp* binop DEBUGARG(int indent));
 
     // Merge assertions from AssertionProp's flags, for the corresponding "phiArg."
     // Requires "pRange" to contain range that is computed partially.
@@ -540,4 +552,354 @@ private:
     // The number of nodes for which range is computed throughout the current method.
     // When this limit is zero, we have exhausted all the budget to walk the ud-chain.
     int m_nVisitBudget;
+
+    template <typename TVisitor>
+    friend class DefinitionIterator;
+};
+
+template <typename TVisitor>
+class DefinitionIterator : public GenTreeVisitor<TVisitor>
+{
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, short> SearchPath;
+protected:
+    SearchPath* m_pPath;
+    RangeCheck* m_pRangeCheck;
+    short iterNum = 0;
+    int depth = 0; // TODO: debug only
+
+    Compiler::fgWalkResult PreOrderVisit(GenTree** use, GenTree* user)
+    {
+        // TODO: skip subtrees
+        depth++;
+        return Compiler::WALK_CONTINUE;
+    }
+
+    Compiler::fgWalkResult PostOrderVisit(GenTree** use, GenTree* user)
+    {
+        GenTree* node = *use;
+        if (node->IsLocal())
+        {
+            LclSsaVarDsc* ssaDef = m_pRangeCheck->GetSsaDefAsg(node->AsLclVarCommon());
+            if (ssaDef == nullptr)
+            {
+                // TODO: error
+            }
+            else
+            {
+                ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&ssaDef->GetAssignment()->gtOp2, nullptr);
+            }
+        }
+        else if (user->OperIs(GT_PHI))
+        {
+            for (GenTreePhi::Use& use : user->AsPhi()->Uses())
+            {
+                GenTree* useNode = use.GetNode();
+                //TODO_Nathan: ??
+                ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&useNode, nullptr);
+            }
+        }
+
+        Range range = m_pRangeCheck->ComputeRange(node, widen DEBUGARG(depth));
+        WalkNodeRange(node, range DEBUGARG(depth));
+
+        depth--;
+    }
+
+protected:
+    bool widen = false;
+
+    void PostOrderWalkNode(GenTree* node);
+
+public:
+    enum
+    {
+        DoPreOrder = true
+    };
+
+    void SetWiden(bool toWiden)
+    {
+        widen = toWiden;
+    }
+
+    void StartWalk(GenTree* node)
+    {
+        //TODO_Nathan: ??
+        ((GenTreeVisitor<TVisitor>*)this)->WalkNode(node);
+        iterNum++;
+    }
+
+    // TODO_Nathan: Better name
+    void WalkNodeRange(GenTree* node, const Range& range DEBUGARG(int indent))
+    {
+        return;
+    }
+
+    DefinitionIterator(RangeCheck* rangeCheck)
+        : GenTreeVisitor<TVisitor>(rangeCheck->m_pCompiler),
+        m_pRangeCheck(rangeCheck)
+    {
+        m_pPath = new (m_pRangeCheck->m_alloc) SearchPath(m_pRangeCheck->m_alloc);
+    }
+};
+
+// Helpers for operations performed on ranges
+struct RangeOps
+{
+    // Given a constant limit in "l1", add it to l2 and mutate "l2".
+    static Limit AddConstantLimit(const Limit& l1, const Limit& l2)
+    {
+        assert(l1.IsConstant());
+        Limit l = l2;
+        if (l.AddConstant(l1.GetConstant()))
+        {
+            return l;
+        }
+        else
+        {
+            return Limit(Limit::keUnknown);
+        }
+    }
+
+    static Limit Add(Limit& l1, Limit& l2, RangeCheck* rc)
+    {
+        if (rc->AddOverflows(l1, l2))
+        {
+            return Limit::keDependent;
+        }
+
+        if (l1.IsUnknown() || l2.IsUnknown())
+        {
+            return Limit(Limit::keUnknown);
+        }
+        else if (l1.IsDependent() || l1.IsDependent())
+        {
+            return Limit(Limit::keDependent);
+        }
+        else if (l1.IsConstant() || l2.IsConstant())
+        {
+            if (l1.IsConstant())
+            {
+                return AddConstantLimit(l1, l2);
+            }
+            else
+            {
+                return AddConstantLimit(l2, l1);
+            }
+        }
+        else
+        {
+            return Limit(Limit::keUnknown);
+        }
+    }
+
+    // Given two ranges "r1" and "r2", perform an add operation on the
+    // ranges.
+    static Range Add(Range& r1, Range& r2, RangeCheck* rc)
+    {
+        Limit& r1lo = r1.LowerLimit();
+        Limit& r1hi = r1.UpperLimit();
+        Limit& r2lo = r2.LowerLimit();
+        Limit& r2hi = r2.UpperLimit();
+
+        Range result = Limit(Limit::keUnknown);
+
+        result.lLimit = Add(r1lo, r2lo, rc);
+        result.uLimit = Add(r2lo, r2hi, rc);
+
+        // Either Dependent or Unknown can overflow
+        if (result.lLimit.IsDependent() || result.lLimit.IsUnknown())
+        {
+            result.uLimit = result.lLimit;
+        }
+        else if (result.uLimit.IsDependent() || result.uLimit.IsUnknown())
+        {
+            result.lLimit = result.uLimit;
+        }
+
+        return result;
+    }
+
+    // TODO: re-write this in terms of compares below
+    // Given two ranges "r1" and "r2", do a Phi merge. If "monIncreasing" is true,
+    // then ignore the dependent variables for the lower bound but not for the upper bound.
+    static Range Merge(Range& r1, Range& r2)
+    {
+        Limit& r1lo = r1.LowerLimit();
+        Limit& r1hi = r1.UpperLimit();
+        Limit& r2lo = r2.LowerLimit();
+        Limit& r2hi = r2.UpperLimit();
+
+        // Take care of lo part.
+        Range result = Limit(Limit::keUnknown);
+        result.SetIsRecursive(r1.IsRecursive() || r2.IsRecursive());
+        if (r1lo.IsUnknown() || r2lo.IsUnknown())
+        {
+            result.lLimit = Limit(Limit::keUnknown);
+        }
+        // Uninitialized, just copy.
+        else if (r1lo.IsUndef())
+        {
+            result.lLimit = r2lo;
+        }
+        else if (r1lo.IsDependent() || r2lo.IsDependent())
+        {
+            // TODO_Nathan
+            result.lLimit = Limit(Limit::keDependent);
+        }
+
+        // Take care of hi part.
+        if (r1hi.IsUnknown() || r2hi.IsUnknown())
+        {
+            result.uLimit = Limit(Limit::keUnknown);
+        }
+        else if (r1hi.IsUndef())
+        {
+            result.uLimit = r2hi;
+        }
+        else if (r1hi.IsDependent() || r2hi.IsDependent())
+        {
+            result.uLimit = Limit(Limit::keDependent);
+        }
+
+        if (r1lo.IsConstant() && r2lo.IsConstant())
+        {
+            result.lLimit = Limit(Limit::keConstant, min(r1lo.GetConstant(), r2lo.GetConstant()));
+        }
+        if (r1hi.IsConstant() && r2hi.IsConstant())
+        {
+            result.uLimit = Limit(Limit::keConstant, max(r1hi.GetConstant(), r2hi.GetConstant()));
+        }
+        if (r2hi.Equals(r1hi))
+        {
+            result.uLimit = r2hi;
+        }
+        if (r2lo.Equals(r1lo))
+        {
+            result.lLimit = r1lo;
+        }
+        // Widen Upper Limit => Max(k, (a.len + n)) yields (a.len + n),
+        // This is correct if k >= 0 and n >= k, since a.len always >= 0
+        // (a.len + n) could overflow, but the result (a.len + n) also
+        // preserves the overflow.
+        if (r1hi.IsConstant() && r1hi.GetConstant() >= 0 && r2hi.IsBinOpArray() &&
+            r2hi.GetConstant() >= r1hi.GetConstant())
+        {
+            result.uLimit = r2hi;
+        }
+        if (r2hi.IsConstant() && r2hi.GetConstant() >= 0 && r1hi.IsBinOpArray() &&
+            r1hi.GetConstant() >= r2hi.GetConstant())
+        {
+            result.uLimit = r1hi;
+        }
+        if (r1hi.IsBinOpArray() && r2hi.IsBinOpArray() && r1hi.vn == r2hi.vn)
+        {
+            result.uLimit = r1hi;
+            // Widen the upper bound if the other constant is greater.
+            if (r2hi.GetConstant() > r1hi.GetConstant())
+            {
+                result.uLimit = r2hi;
+            }
+        }
+        return result;
+    }
+
+    enum CompareResults {
+        GreaterThen, // >
+        LessThen, // <
+        Equals, // ==
+        CouldNotCompare
+    };
+
+    static CompareResults CompareLimit(const Limit& lhs, const Limit& rhs)
+    {
+        if (lhs.IsUnknown() || rhs.IsUnknown())
+        {
+            return CouldNotCompare;
+        }
+
+        if (lhs.IsDependent() || rhs.IsDependent())
+        {
+            if (lhs.IsDependent() && rhs.IsDependent())
+            {
+                return Equals;
+            }
+            else if (lhs.IsDependent())
+            {
+                return GreaterThen;
+            }
+            else
+            {
+                return LessThen;
+            }
+        }
+        else if (rhs.Equals(lhs))
+        {
+            return Equals;
+        }
+        else if (rhs.IsConstant() && lhs.IsConstant())
+        {
+            int rhsConstant = rhs.GetConstant();
+            int lhsConstant = lhs.GetConstant();
+            assert(rhsConstant != lhsConstant);
+            if (rhsConstant < lhsConstant)
+            {
+                return LessThen;
+            }
+            else
+            {
+                return GreaterThen;
+            }
+        }
+        else if (rhs.IsBinOpArray() && lhs.IsBinOpArray())
+        {
+            // Note: these vns could be anything and could be valid, as we know that they are identical
+            if (rhs.vn != lhs.vn)
+            {
+                return CouldNotCompare;
+            }
+
+            int rhsOffset = rhs.GetConstant();
+            int lhsOffset = lhs.GetConstant();
+
+            assert(rhsOffset != lhsOffset);
+            if (rhsOffset < lhsOffset)
+            {
+                return LessThen;
+            }
+            else
+            {
+                return GreaterThen;
+            }
+        }
+        else if (rhs.IsBinOpArray() && lhs.IsConstant())
+        {
+            // TODO: should really be checking the vn here, as it doesn't have to 
+            // be a checked bound
+            int rhsOffset = rhs.GetConstant();
+            int lhsConstant = lhs.GetConstant();
+
+            // Max(k, (a.len + n)) yields (a.len + n),
+            // This is correct if k >= 0 and n >= k, since a.len always >= 0
+            // (a.len + n) could overflow, but we account for that elsewhere
+            // and it should be turned into the appropriete bound
+            if (rhsOffset > lhsConstant)
+            {
+                return GreaterThen; // TODO_Nathan: potential CQ loss here, as we don't handle >=
+            }
+        }
+        else if (rhs.IsConstant() && lhs.IsBinOpArray())
+        {
+            // TODO: should really be checking the vn here, as it doesn't have to 
+            // be a checked bound
+            int lhsOffset = lhs.GetConstant();
+            int rhsConstant = rhs.GetConstant();
+
+            if (rhsConstant < lhsOffset)
+            {
+                return LessThen; // TODO_Nathan: potential CQ loss here, as we don't handle >=
+            }
+        }
+
+        return CouldNotCompare;
+    }
 };
