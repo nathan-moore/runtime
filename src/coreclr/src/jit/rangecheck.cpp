@@ -31,26 +31,6 @@ bool RangeCheck::IsOverBudget()
     return (m_nVisitBudget <= 0);
 }
 
-// Get the range map in which computed ranges are cached.
-RangeCheck::RangeMap* RangeCheck::GetRangeMap()
-{
-    if (m_pRangeMap == nullptr)
-    {
-        m_pRangeMap = new (m_alloc) RangeMap(m_alloc);
-    }
-    return m_pRangeMap;
-}
-
-// Get the overflow map in which computed overflows are cached.
-RangeCheck::OverflowMap* RangeCheck::GetOverflowMap()
-{
-    if (m_pOverflowMap == nullptr)
-    {
-        m_pOverflowMap = new (m_alloc) OverflowMap(m_alloc);
-    }
-    return m_pOverflowMap;
-}
-
 // Get the length of the array vn, if it is new.
 int RangeCheck::GetArrLength(ValueNum vn)
 {
@@ -303,13 +283,18 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
         }
     }
 
-    GetRangeMap()->RemoveAll();
+    GetRangeMap()->RemoveAll(); // TODO: remove
+    GetOverflowMap()->RemoveAll();
     m_pSearchPath = new (m_alloc) SearchPath(m_alloc);
 
-    // Get the range for this index.
+    NodeWidener widener(this);
+    // Compute the range for this index.
+    widener.StartWalk(treeIndex);
+
+    // TODO_Nathan: this will double print?
     Range range = GetRange(treeIndex DEBUGARG(0));
 
-    // If upper or lower limit is found to be unknown (top), or it was found to
+    // If upper or lower limit is found to be unknown, or it was found to
     // be unknown because of over budget or a deep search, then return early.
     if (range.UpperLimit().IsUnknown() || range.LowerLimit().IsUnknown())
     {
@@ -319,6 +304,8 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
     }
     else if (range.IsRecursive())
     {
+        widener.SetWiden(true);
+        widener.StartWalk(treeIndex);
         range = GetRange(treeIndex DEBUGARG(0));
         assert(!range.IsRecursive());
     }
@@ -329,6 +316,14 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
     // If upper or lower limit is unknown, then return.
     if (range.UpperLimit().IsUnknown() || range.LowerLimit().IsUnknown())
     {
+        return;
+    }
+
+    // TODO: narrowing
+    // TODO: enable overflow
+    if (false && DoesOverflow(treeIndex))
+    {
+        JITDUMP("Method determined to overflow\n");
         return;
     }
 
@@ -788,17 +783,48 @@ Range RangeCheck::ComputeRangeForLocalDef(GenTreeLclVarCommon* lcl
         JITDUMP("----------------------------------------------------\n");
     }
 #endif
-    Range range = GetRange(ssaDef->GetBlock(), ssaDef->GetAssignment()->gtGetOp2(), monIncreasing DEBUGARG(indent));
+    Range range = GetRange(ssaDef->GetAssignment()->gtGetOp2() DEBUGARG(indent));
+    /*
     if (!BitVecOps::MayBeUninit(block->bbAssertionIn) && (m_pCompiler->GetAssertionCount() > 0))
     {
         JITDUMP("Merge assertions from " FMT_BB ":%s for assignment about [%06d]\n", block->bbNum,
                 BitVecOps::ToString(m_pCompiler->apTraits, block->bbAssertionIn),
                 Compiler::dspTreeID(ssaDef->GetAssignment()->gtGetOp1()));
-        MergeEdgeAssertions(ssaDef->GetAssignment()->gtGetOp1()->AsLclVarCommon(), block->bbAssertionIn, &range);
+        // TODO_Nathan: Edge Assertions
+        // MergeEdgeAssertions(ssaDef->GetAssignment()->gtGetOp1()->AsLclVarCommon(), block->bbAssertionIn, &range);
         JITDUMP("done merging\n");
-    }
+    }*/
     return range;
 }
+
+Range RangeCheck::MergePhi(GenTree* expr, bool widen DEBUGARG(int indent))
+{
+    Range range = Limit(Limit::keUnknown);
+    for (GenTreePhi::Use& use : expr->AsPhi()->Uses())
+    {
+        Range argRange = GetRange(use.GetNode() DEBUGARG(indent));
+
+        if (widen)
+        {
+            assert(!argRange.IsRecursive());
+        }
+        else if (argRange.IsRecursive())
+        {
+            JITDUMP("Skipping recursive phi use\n")
+            continue;
+        }
+
+        assert(!argRange.LowerLimit().IsUndef());
+        assert(!argRange.UpperLimit().IsUndef());
+        JITDUMP("Merging ranges %s %s:", range.ToString(m_pCompiler->getAllocatorDebugOnly()),
+                argRange.ToString(m_pCompiler->getAllocatorDebugOnly()));
+        range = RangeOps::Merge(range, argRange);
+        JITDUMP("%s\n", range.ToString(m_pCompiler->getAllocatorDebugOnly()));
+    }
+
+    return range;
+}
+
 
 // https://msdn.microsoft.com/en-us/windows/apps/hh285054.aspx
 // CLR throws IDS_EE_ARRAY_DIMENSIONS_EXCEEDED if array length is > INT_MAX.
@@ -856,50 +882,39 @@ bool RangeCheck::AddOverflows(Limit& limit1, Limit& limit2)
 }
 
 // Does the bin operation overflow.
-bool RangeCheck::DoesBinOpOverflow(BasicBlock* block, GenTreeOp* binop)
+bool RangeCheck::DoesBinOpOverflow(GenTreeOp* binop)
 {
     GenTree* op1 = binop->gtGetOp1();
     GenTree* op2 = binop->gtGetOp2();
 
-    if (!m_pSearchPath->Lookup(op1) && DoesOverflow(block, op1))
+    if (!m_pSearchPath->Lookup(op1) && DoesOverflow(op1))
     {
         return true;
     }
 
-    if (!m_pSearchPath->Lookup(op2) && DoesOverflow(block, op2))
+    if (!m_pSearchPath->Lookup(op2) && DoesOverflow(op2))
     {
         return true;
     }
 
+    //TODO_Nathan: Improve this (eg take poiner?)
     // Get the cached ranges of op1
-    Range* op1Range = nullptr;
+    Range op1Range = Range(Limit::keUnknown);
     if (!GetRangeMap()->Lookup(op1, &op1Range))
     {
         return true;
     }
     // Get the cached ranges of op2
-    Range* op2Range = nullptr;
+    Range op2Range = Range(Limit::keUnknown);
     if (!GetRangeMap()->Lookup(op2, &op2Range))
     {
         return true;
     }
 
-    // If dependent, check if we can use some assertions.
-    if (op1Range->UpperLimit().IsDependent())
-    {
-        MergeAssertion(block, op1, op1Range DEBUGARG(0));
-    }
+    JITDUMP("Checking bin op overflow %s %s\n", op1Range.ToString(m_pCompiler->getAllocatorDebugOnly()),
+            op2Range.ToString(m_pCompiler->getAllocatorDebugOnly()));
 
-    // If dependent, check if we can use some assertions.
-    if (op2Range->UpperLimit().IsDependent())
-    {
-        MergeAssertion(block, op2, op2Range DEBUGARG(0));
-    }
-
-    JITDUMP("Checking bin op overflow %s %s\n", op1Range->ToString(m_pCompiler->getAllocatorDebugOnly()),
-            op2Range->ToString(m_pCompiler->getAllocatorDebugOnly()));
-
-    if (!AddOverflows(op1Range->UpperLimit(), op2Range->UpperLimit()))
+    if (!AddOverflows(op1Range.UpperLimit(), op2Range.UpperLimit()))
     {
         return false;
     }
@@ -910,10 +925,10 @@ bool RangeCheck::DoesBinOpOverflow(BasicBlock* block, GenTreeOp* binop)
 bool RangeCheck::DoesVarDefOverflow(GenTreeLclVarCommon* lcl)
 {
     LclSsaVarDsc* ssaDef = GetSsaDefAsg(lcl);
-    return (ssaDef == nullptr) || DoesOverflow(ssaDef->GetBlock(), ssaDef->GetAssignment()->gtGetOp2());
+    return (ssaDef == nullptr) || DoesOverflow(ssaDef->GetAssignment()->gtGetOp2());
 }
 
-bool RangeCheck::DoesPhiOverflow(BasicBlock* block, GenTree* expr)
+bool RangeCheck::DoesPhiOverflow(GenTree* expr)
 {
     for (GenTreePhi::Use& use : expr->AsPhi()->Uses())
     {
@@ -922,7 +937,7 @@ bool RangeCheck::DoesPhiOverflow(BasicBlock* block, GenTree* expr)
         {
             continue;
         }
-        if (DoesOverflow(block, arg))
+        if (DoesOverflow(arg))
         {
             return true;
         }
@@ -930,20 +945,20 @@ bool RangeCheck::DoesPhiOverflow(BasicBlock* block, GenTree* expr)
     return false;
 }
 
-bool RangeCheck::DoesOverflow(BasicBlock* block, GenTree* expr)
+bool RangeCheck::DoesOverflow(GenTree* expr)
 {
+    //TODO_Nathan: improve
     bool overflows = false;
     if (!GetOverflowMap()->Lookup(expr, &overflows))
     {
-        overflows = ComputeDoesOverflow(block, expr);
+        overflows = ComputeDoesOverflow(expr);
     }
     return overflows;
 }
 
-bool RangeCheck::ComputeDoesOverflow(BasicBlock* block, GenTree* expr)
+bool RangeCheck::ComputeDoesOverflow(GenTree* expr)
 {
     JITDUMP("Does overflow [%06d]?\n", Compiler::dspTreeID(expr));
-    m_pSearchPath->Set(expr, block, SearchPath::Overwrite);
 
     bool overflows = true;
 
@@ -962,7 +977,7 @@ bool RangeCheck::ComputeDoesOverflow(BasicBlock* block, GenTree* expr)
     }
     else if (expr->OperGet() == GT_COMMA)
     {
-        overflows = ComputeDoesOverflow(block, expr->gtEffectiveVal());
+        overflows = ComputeDoesOverflow(expr->gtEffectiveVal());
     }
     // Check if the var def has rhs involving arithmetic that overflows.
     else if (expr->IsLocal())
@@ -972,7 +987,7 @@ bool RangeCheck::ComputeDoesOverflow(BasicBlock* block, GenTree* expr)
     // Check if add overflows.
     else if (expr->OperGet() == GT_ADD)
     {
-        overflows = DoesBinOpOverflow(block, expr->AsOp());
+        overflows = DoesBinOpOverflow(expr->AsOp());
     }
     // GT_AND, GT_UMOD, GT_LSH and GT_RSH don't overflow
     // Actually, GT_LSH can overflow so it depends on the analysis done in ComputeRangeForBinOp
@@ -983,13 +998,13 @@ bool RangeCheck::ComputeDoesOverflow(BasicBlock* block, GenTree* expr)
     // Walk through phi arguments to check if phi arguments involve arithmetic that overflows.
     else if (expr->OperGet() == GT_PHI)
     {
-        overflows = DoesPhiOverflow(block, expr);
+        overflows = DoesPhiOverflow(expr);
     }
     GetOverflowMap()->Set(expr, overflows, OverflowMap::Overwrite);
-    m_pSearchPath->Remove(expr);
     JITDUMP("[%06d] %s\n", Compiler::dspTreeID(expr), ((overflows) ? "overflows" : "does not overflow"));
     return overflows;
 }
+
 
 //------------------------------------------------------------------------
 // ComputeRange: Compute the range recursively by asking for the range of each variable in the dependency chain.

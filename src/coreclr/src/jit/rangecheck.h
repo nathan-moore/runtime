@@ -59,18 +59,19 @@
 #pragma once
 #include "compiler.h"
 
-static bool IntAddOverflows(int max1, int max2)
-{
-    if (max1 > 0 && max2 > 0 && INT_MAX - max1 < max2)
+    static bool IntAddOverflows(int max1, int max2)
     {
-        return true;
+        if (max1 > 0 && max2 > 0 && INT_MAX - max1 < max2)
+        {
+            return true;
+        }
+        if (max1 < 0 && max2 < 0 && max1 < INT_MIN - max2)
+        {
+            return true;
+        }
+        return false;
     }
-    if (max1 < 0 && max2 < 0 && max1 < INT_MIN - max2)
-    {
-        return true;
-    }
-    return false;
-}
+
 
 struct Limit
 {
@@ -80,7 +81,7 @@ struct Limit
         keBinOpArray,
         keConstant,
         keDependent, // The limit is dependent on some other value.
-        keUnknown,   // The limit could not be determined.
+        keUnknown,   // The limit could not be determined. Lattice top
     };
 
     int       cns;
@@ -244,153 +245,6 @@ struct Range
 #endif
 };
 
-// Helpers for operations performed on ranges
-struct RangeOps
-{
-    // Given a constant limit in "l1", add it to l2 and mutate "l2".
-    static Limit AddConstantLimit(Limit& l1, Limit& l2)
-    {
-        assert(l1.IsConstant());
-        Limit l = l2;
-        if (l.AddConstant(l1.GetConstant()))
-        {
-            return l;
-        }
-        else
-        {
-            return Limit(Limit::keUnknown);
-        }
-    }
-
-    // Given two ranges "r1" and "r2", perform an add operation on the
-    // ranges.
-    static Range Add(Range& r1, Range& r2)
-    {
-        Limit& r1lo = r1.LowerLimit();
-        Limit& r1hi = r1.UpperLimit();
-        Limit& r2lo = r2.LowerLimit();
-        Limit& r2hi = r2.UpperLimit();
-
-        Range result = Limit(Limit::keUnknown);
-
-        // Check lo ranges if they are dependent and not unknown.
-        if ((r1lo.IsDependent() && !r1lo.IsUnknown()) || (r2lo.IsDependent() && !r2lo.IsUnknown()))
-        {
-            result.lLimit = Limit(Limit::keDependent);
-        }
-        // Check hi ranges if they are dependent and not unknown.
-        if ((r1hi.IsDependent() && !r1hi.IsUnknown()) || (r2hi.IsDependent() && !r2hi.IsUnknown()))
-        {
-            result.uLimit = Limit(Limit::keDependent);
-        }
-
-        if (r1lo.IsConstant())
-        {
-            result.lLimit = AddConstantLimit(r1lo, r2lo);
-        }
-        if (r2lo.IsConstant())
-        {
-            result.lLimit = AddConstantLimit(r2lo, r1lo);
-        }
-        if (r1hi.IsConstant())
-        {
-            result.uLimit = AddConstantLimit(r1hi, r2hi);
-        }
-        if (r2hi.IsConstant())
-        {
-            result.uLimit = AddConstantLimit(r2hi, r1hi);
-        }
-        return result;
-    }
-
-    // Given two ranges "r1" and "r2", do a Phi merge. If "monIncreasing" is true,
-    // then ignore the dependent variables for the lower bound but not for the upper bound.
-    static Range Merge(Range& r1, Range& r2, bool monIncreasing)
-    {
-        Limit& r1lo = r1.LowerLimit();
-        Limit& r1hi = r1.UpperLimit();
-        Limit& r2lo = r2.LowerLimit();
-        Limit& r2hi = r2.UpperLimit();
-
-        // Take care of lo part.
-        Range result = Limit(Limit::keUnknown);
-        if (r1lo.IsUnknown() || r2lo.IsUnknown())
-        {
-            result.lLimit = Limit(Limit::keUnknown);
-        }
-        // Uninitialized, just copy.
-        else if (r1lo.IsUndef())
-        {
-            result.lLimit = r2lo;
-        }
-        else if (r1lo.IsDependent() || r2lo.IsDependent())
-        {
-            if (monIncreasing)
-            {
-                result.lLimit = r1lo.IsDependent() ? r2lo : r1lo;
-            }
-            else
-            {
-                result.lLimit = Limit(Limit::keDependent);
-            }
-        }
-
-        // Take care of hi part.
-        if (r1hi.IsUnknown() || r2hi.IsUnknown())
-        {
-            result.uLimit = Limit(Limit::keUnknown);
-        }
-        else if (r1hi.IsUndef())
-        {
-            result.uLimit = r2hi;
-        }
-        else if (r1hi.IsDependent() || r2hi.IsDependent())
-        {
-            result.uLimit = Limit(Limit::keDependent);
-        }
-
-        if (r1lo.IsConstant() && r2lo.IsConstant())
-        {
-            result.lLimit = Limit(Limit::keConstant, min(r1lo.GetConstant(), r2lo.GetConstant()));
-        }
-        if (r1hi.IsConstant() && r2hi.IsConstant())
-        {
-            result.uLimit = Limit(Limit::keConstant, max(r1hi.GetConstant(), r2hi.GetConstant()));
-        }
-        if (r2hi.Equals(r1hi))
-        {
-            result.uLimit = r2hi;
-        }
-        if (r2lo.Equals(r1lo))
-        {
-            result.lLimit = r1lo;
-        }
-        // Widen Upper Limit => Max(k, (a.len + n)) yields (a.len + n),
-        // This is correct if k >= 0 and n >= k, since a.len always >= 0
-        // (a.len + n) could overflow, but the result (a.len + n) also
-        // preserves the overflow.
-        if (r1hi.IsConstant() && r1hi.GetConstant() >= 0 && r2hi.IsBinOpArray() &&
-            r2hi.GetConstant() >= r1hi.GetConstant())
-        {
-            result.uLimit = r2hi;
-        }
-        if (r2hi.IsConstant() && r2hi.GetConstant() >= 0 && r1hi.IsBinOpArray() &&
-            r1hi.GetConstant() >= r2hi.GetConstant())
-        {
-            result.uLimit = r1hi;
-        }
-        if (r1hi.IsBinOpArray() && r2hi.IsBinOpArray() && r1hi.vn == r2hi.vn)
-        {
-            result.uLimit = r1hi;
-            // Widen the upper bound if the other constant is greater.
-            if (r2hi.GetConstant() > r1hi.GetConstant())
-            {
-                result.uLimit = r2hi;
-            }
-        }
-        return result;
-    }
-};
 
 class RangeCheck
 {
@@ -486,6 +340,8 @@ public:
     // refine the "pRange" value.
     void MergeEdgeAssertions(GenTreeLclVarCommon* lcl, ASSERT_VALARG_TP assertions, Range* pRange);
 
+    Range MergePhi(GenTree* expr, bool widen DEBUGARG(int indent));
+
     // The maximum possible value of the given "limit." If such a value could not be determined
     // return "false." For example: ARRLEN_MAX for array length.
     bool GetLimitMax(Limit& limit, int* pMax);
@@ -494,38 +350,34 @@ public:
     bool AddOverflows(Limit& limit1, Limit& limit2);
 
     // Does the binary operation between the operands overflow? Check recursively.
-    bool DoesBinOpOverflow(BasicBlock* block, GenTreeOp* binop);
+    bool DoesBinOpOverflow(GenTreeOp* binop);
 
     // Does the phi operands involve an assignment that could overflow?
-    bool DoesPhiOverflow(BasicBlock* block, GenTree* expr);
+    bool DoesPhiOverflow(GenTree* expr);
 
     // Find the def of the "expr" local and recurse on the arguments if any of them involve a
     // calculation that overflows.
     bool DoesVarDefOverflow(GenTreeLclVarCommon* lcl);
 
-    bool ComputeDoesOverflow(BasicBlock* block, GenTree* expr);
+    bool ComputeDoesOverflow(GenTree* expr);
 
     // Does the current "expr" which is a use involve a definition, that overflows.
-    bool DoesOverflow(BasicBlock* block, GenTree* tree);
-
-    // Widen the range by first checking if the induction variable is monotonically increasing.
-    // Requires "pRange" to be partially computed.
-    void Widen(BasicBlock* block, GenTree* tree, Range* pRange);
-
-    // Is the binary operation increasing the value.
-    bool IsBinOpMonotonicallyIncreasing(GenTreeOp* binop);
-
-    // Given an "expr" trace its rhs and their definitions to check if all the assignments
-    // are monotonically increasing.
-    //
-    bool IsMonotonicallyIncreasing(GenTree* tree, bool rejectNegativeConst);
+    bool DoesOverflow(GenTree* tree);
 
     // We allocate a budget to avoid walking long UD chains. When traversing each link in the UD
     // chain, we decrement the budget. When the budget hits 0, then no more range check optimization
     // will be applied for the currently compiled method.
     bool IsOverBudget();
 
+    void SetRange(GenTree* node, const Range& range);
+
 private:
+    // https://msdn.microsoft.com/en-us/windows/apps/hh285054.aspx
+    // CLR throws IDS_EE_ARRAY_DIMENSIONS_EXCEEDED if array length is > INT_MAX.
+    // new byte[INT_MAX]; still throws OutOfMemoryException on my system with 32 GB RAM.
+    // I believe practical limits are still smaller than this number.
+    static const unsigned int ArrLen_Max = 0x7FFFFFFF;
+
     // Given a lclvar use, try to find the lclvar's defining assignment and its containing block.
     LclSsaVarDsc* GetSsaDefAsg(GenTreeLclVarCommon* lclUse);
 
@@ -566,7 +418,12 @@ protected:
     RangeCheck* m_pRangeCheck;
     short iterNum = 0;
     int depth = 0; // TODO: debug only
+    bool error = false; // TODO_Better handling?
+    bool widen = false;
 
+    void PostOrderWalkNode(GenTree* node);
+
+public:
     Compiler::fgWalkResult PreOrderVisit(GenTree** use, GenTree* user)
     {
         // TODO: skip subtrees
@@ -582,6 +439,8 @@ protected:
             LclSsaVarDsc* ssaDef = m_pRangeCheck->GetSsaDefAsg(node->AsLclVarCommon());
             if (ssaDef == nullptr)
             {
+                error = true;
+                return Compiler::WALK_ABORT;
                 // TODO: error
             }
             else
@@ -603,14 +462,10 @@ protected:
         WalkNodeRange(node, range DEBUGARG(depth));
 
         depth--;
+
+        return Compiler::WALK_CONTINUE;
     }
 
-protected:
-    bool widen = false;
-
-    void PostOrderWalkNode(GenTree* node);
-
-public:
     enum
     {
         DoPreOrder = true
@@ -624,7 +479,7 @@ public:
     void StartWalk(GenTree* node)
     {
         //TODO_Nathan: ??
-        ((GenTreeVisitor<TVisitor>*)this)->WalkNode(node);
+        ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&node, nullptr);
         iterNum++;
     }
 
