@@ -245,261 +245,6 @@ struct Range
 #endif
 };
 
-
-class RangeCheck
-{
-public:
-    // Constructor
-    RangeCheck(Compiler* pCompiler);
-
-    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, bool>        OverflowMap;
-    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, Range>      RangeMap;
-    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, BasicBlock*> SearchPath;
-
-#ifdef DEBUG
-    // TODO-Cleanup: This code has been kept around just to ensure that the SSA data is still
-    // valid when RangeCheck runs. It should be removed at some point (and perhaps replaced
-    // by a proper SSA validity checker).
-
-    // Location information is used to map where the defs occur in the method.
-    struct Location
-    {
-        BasicBlock*          block;
-        Statement*           stmt;
-        GenTreeLclVarCommon* tree;
-        GenTree*             parent;
-        Location(BasicBlock* block, Statement* stmt, GenTreeLclVarCommon* tree, GenTree* parent)
-            : block(block), stmt(stmt), tree(tree), parent(parent)
-        {
-        }
-
-    private:
-        Location();
-    };
-
-    typedef JitHashTable<INT64, JitLargePrimitiveKeyFuncs<INT64>, Location*> VarToLocMap;
-
-    // Generate a hashcode unique for this ssa var.
-    UINT64 HashCode(unsigned lclNum, unsigned ssaNum);
-
-    // Add a location of the definition of ssa var to the location map.
-    // Requires "hash" to be computed using HashCode.
-    // Requires "location" to be the local definition.
-    void SetDef(UINT64 hash, Location* loc);
-
-    // Given a tree node that is a local, return the Location defining the local.
-    Location* GetDef(GenTreeLclVarCommon* lcl);
-    Location* GetDef(unsigned lclNum, unsigned ssaNum);
-
-    // Given a statement, check if it is a def and add its locations in a map.
-    void MapStmtDefs(const Location& loc);
-
-    // Given the CFG, check if it has defs and add their locations in a map.
-    void MapMethodDefs();
-#endif
-
-    int GetArrLength(ValueNum vn);
-
-    // Check whether the computed range is within 0 and upper bounds. This function
-    // assumes that the lower range is resolved and upper range is symbolic as in an
-    // increasing loop.
-    // TODO-CQ: This is not general enough.
-    bool BetweenBounds(Range& range, GenTree* upper, int arrSize);
-
-    // Entry point to optimize range checks in the block. Assumes value numbering
-    // and assertion prop phases are completed.
-    void OptimizeRangeChecks();
-
-    // Given a "tree" node, check if it contains array bounds check node and
-    // optimize to remove it, if possible. Requires "stmt" and "block" that
-    // contain the tree.
-    void OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree* tree);
-
-    // Given the index expression try to find its range.
-    // The range of a variable depends on its rhs which in turn depends on its constituent variables.
-    // The "path" is the path taken in the search for the rhs' range and its constituents' range.
-    // If "monIncreasing" is true, the calculations are made more liberally assuming initial values
-    // at phi definitions for the lower bound.
-    Range GetRange(GenTree* expr DEBUGARG(int indent));
-
-    // Given the local variable, first find the definition of the local and find the range of the rhs.
-    // Helper for GetRange.
-    Range ComputeRangeForLocalDef(GenTreeLclVarCommon* lcl DEBUGARG(int indent));
-
-    // Compute the range, rather than retrieve a cached value. Helper for GetRange.
-    Range ComputeRange(GenTree* expr, bool widen DEBUGARG(int indent));
-
-    // Compute the range for the op1 and op2 for the given binary operator.
-    Range ComputeRangeForBinOp(GenTreeOp* binop DEBUGARG(int indent));
-
-    // Merge assertions from AssertionProp's flags, for the corresponding "phiArg."
-    // Requires "pRange" to contain range that is computed partially.
-    void MergeAssertion(BasicBlock* block, GenTree* phiArg, Range* pRange DEBUGARG(int indent));
-
-    // Inspect the "assertions" and extract assertions about the given "phiArg" and
-    // refine the "pRange" value.
-    void MergeEdgeAssertions(GenTreeLclVarCommon* lcl, ASSERT_VALARG_TP assertions, Range* pRange);
-
-    Range MergePhi(GenTree* expr, bool widen DEBUGARG(int indent));
-
-    // Inspect the assertions about the current ValueNum to refine pRange
-    void MergeEdgeAssertions(ValueNum num, ASSERT_VALARG_TP assertions, Range* pRange);
-
-    // The maximum possible value of the given "limit." If such a value could not be determined
-    // return "false." For example: ARRLEN_MAX for array length.
-    bool GetLimitMax(Limit& limit, int* pMax);
-
-    // Does the addition of the two limits overflow?
-    bool AddOverflows(Limit& limit1, Limit& limit2);
-
-    // Does the binary operation between the operands overflow? Check recursively.
-    bool DoesBinOpOverflow(GenTreeOp* binop);
-
-    // Does the phi operands involve an assignment that could overflow?
-    bool DoesPhiOverflow(GenTree* expr);
-
-    // Find the def of the "expr" local and recurse on the arguments if any of them involve a
-    // calculation that overflows.
-    bool DoesVarDefOverflow(GenTreeLclVarCommon* lcl);
-
-    bool ComputeDoesOverflow(GenTree* expr);
-
-    // Does the current "expr" which is a use involve a definition, that overflows.
-    bool DoesOverflow(GenTree* tree);
-
-    // We allocate a budget to avoid walking long UD chains. When traversing each link in the UD
-    // chain, we decrement the budget. When the budget hits 0, then no more range check optimization
-    // will be applied for the currently compiled method.
-    bool IsOverBudget();
-
-    void SetRange(GenTree* node, const Range& range);
-
-private:
-    // https://msdn.microsoft.com/en-us/windows/apps/hh285054.aspx
-    // CLR throws IDS_EE_ARRAY_DIMENSIONS_EXCEEDED if array length is > INT_MAX.
-    // new byte[INT_MAX]; still throws OutOfMemoryException on my system with 32 GB RAM.
-    // I believe practical limits are still smaller than this number.
-    static const unsigned int ArrLen_Max = 0x7FFFFFFF;
-
-    // Given a lclvar use, try to find the lclvar's defining assignment and its containing block.
-    LclSsaVarDsc* GetSsaDefAsg(GenTreeLclVarCommon* lclUse);
-
-    GenTreeBoundsChk* m_pCurBndsChk;
-
-    // Get the cached overflow values.
-    OverflowMap* GetOverflowMap();
-    OverflowMap* m_pOverflowMap;
-
-    // Get the cached range values.
-    RangeMap* GetRangeMap();
-    RangeMap* m_pRangeMap;
-
-    SearchPath* m_pSearchPath;
-
-#ifdef DEBUG
-    bool         m_fMappedDefs;
-    VarToLocMap* m_pDefTable;
-#endif
-
-    Compiler*     m_pCompiler;
-    CompAllocator m_alloc;
-
-    // The number of nodes for which range is computed throughout the current method.
-    // When this limit is zero, we have exhausted all the budget to walk the ud-chain.
-    int m_nVisitBudget;
-
-    template <typename TVisitor>
-    friend class DefinitionIterator;
-};
-
-template <typename TVisitor>
-class DefinitionIterator : public GenTreeVisitor<TVisitor>
-{
-    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, short> SearchPath;
-protected:
-    SearchPath* m_pPath;
-    RangeCheck* m_pRangeCheck;
-    short iterNum = 0;
-    int depth = 0; // TODO: debug only
-    bool error = false; // TODO_Better handling?
-    bool widen = false;
-
-    void PostOrderWalkNode(GenTree* node);
-
-public:
-    Compiler::fgWalkResult PreOrderVisit(GenTree** use, GenTree* user)
-    {
-        // TODO: skip subtrees
-        depth++;
-        return Compiler::WALK_CONTINUE;
-    }
-
-    Compiler::fgWalkResult PostOrderVisit(GenTree** use, GenTree* user)
-    {
-        GenTree* node = *use;
-        if (node->IsLocal())
-        {
-            LclSsaVarDsc* ssaDef = m_pRangeCheck->GetSsaDefAsg(node->AsLclVarCommon());
-            if (ssaDef == nullptr)
-            {
-                error = true;
-                return Compiler::WALK_ABORT;
-                // TODO: error
-            }
-            else
-            {
-                ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&ssaDef->GetAssignment()->gtOp2, nullptr);
-            }
-        }
-        else if (user->OperIs(GT_PHI))
-        {
-            for (GenTreePhi::Use& use : user->AsPhi()->Uses())
-            {
-                GenTree* useNode = use.GetNode();
-                //TODO_Nathan: ??
-                ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&useNode, nullptr);
-            }
-        }
-
-        Range range = m_pRangeCheck->ComputeRange(node, widen DEBUGARG(depth));
-        WalkNodeRange(node, range DEBUGARG(depth));
-
-        depth--;
-
-        return Compiler::WALK_CONTINUE;
-    }
-
-    enum
-    {
-        DoPreOrder = true
-    };
-
-    void SetWiden(bool toWiden)
-    {
-        widen = toWiden;
-    }
-
-    void StartWalk(GenTree* node)
-    {
-        //TODO_Nathan: ??
-        ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&node, nullptr);
-        iterNum++;
-    }
-
-    // TODO_Nathan: Better name
-    void WalkNodeRange(GenTree* node, const Range& range DEBUGARG(int indent))
-    {
-        return;
-    }
-
-    DefinitionIterator(RangeCheck* rangeCheck)
-        : GenTreeVisitor<TVisitor>(rangeCheck->m_pCompiler),
-        m_pRangeCheck(rangeCheck)
-    {
-        m_pPath = new (m_pRangeCheck->m_alloc) SearchPath(m_pRangeCheck->m_alloc);
-    }
-};
-
 // Helpers for operations performed on ranges
 struct RangeOps
 {
@@ -759,5 +504,260 @@ struct RangeOps
         }
 
         return CouldNotCompare;
+    }
+};
+
+
+class RangeCheck
+{
+public:
+    // Constructor
+    RangeCheck(Compiler* pCompiler);
+
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, bool>        OverflowMap;
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, Range>      RangeMap;
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, BasicBlock*> SearchPath;
+
+#ifdef DEBUG
+    // TODO-Cleanup: This code has been kept around just to ensure that the SSA data is still
+    // valid when RangeCheck runs. It should be removed at some point (and perhaps replaced
+    // by a proper SSA validity checker).
+
+    // Location information is used to map where the defs occur in the method.
+    struct Location
+    {
+        BasicBlock*          block;
+        Statement*           stmt;
+        GenTreeLclVarCommon* tree;
+        GenTree*             parent;
+        Location(BasicBlock* block, Statement* stmt, GenTreeLclVarCommon* tree, GenTree* parent)
+            : block(block), stmt(stmt), tree(tree), parent(parent)
+        {
+        }
+
+    private:
+        Location();
+    };
+
+    typedef JitHashTable<INT64, JitLargePrimitiveKeyFuncs<INT64>, Location*> VarToLocMap;
+
+    // Generate a hashcode unique for this ssa var.
+    UINT64 HashCode(unsigned lclNum, unsigned ssaNum);
+
+    // Add a location of the definition of ssa var to the location map.
+    // Requires "hash" to be computed using HashCode.
+    // Requires "location" to be the local definition.
+    void SetDef(UINT64 hash, Location* loc);
+
+    // Given a tree node that is a local, return the Location defining the local.
+    Location* GetDef(GenTreeLclVarCommon* lcl);
+    Location* GetDef(unsigned lclNum, unsigned ssaNum);
+
+    // Given a statement, check if it is a def and add its locations in a map.
+    void MapStmtDefs(const Location& loc);
+
+    // Given the CFG, check if it has defs and add their locations in a map.
+    void MapMethodDefs();
+#endif
+
+    int GetArrLength(ValueNum vn);
+
+    // Check whether the computed range is within 0 and upper bounds. This function
+    // assumes that the lower range is resolved and upper range is symbolic as in an
+    // increasing loop.
+    // TODO-CQ: This is not general enough.
+    bool BetweenBounds(Range& range, GenTree* upper, int arrSize);
+
+    // Entry point to optimize range checks in the block. Assumes value numbering
+    // and assertion prop phases are completed.
+    void OptimizeRangeChecks();
+
+    // Given a "tree" node, check if it contains array bounds check node and
+    // optimize to remove it, if possible. Requires "stmt" and "block" that
+    // contain the tree.
+    void OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree* tree);
+
+    // Given the index expression try to find its range.
+    // The range of a variable depends on its rhs which in turn depends on its constituent variables.
+    // The "path" is the path taken in the search for the rhs' range and its constituents' range.
+    // If "monIncreasing" is true, the calculations are made more liberally assuming initial values
+    // at phi definitions for the lower bound.
+    Range GetRange(GenTree* expr DEBUGARG(int indent));
+
+    // Given the local variable, first find the definition of the local and find the range of the rhs.
+    // Helper for GetRange.
+    Range ComputeRangeForLocalDef(GenTreeLclVarCommon* lcl DEBUGARG(int indent));
+
+    // Compute the range, rather than retrieve a cached value. Helper for GetRange.
+    Range ComputeRange(GenTree* expr, bool widen DEBUGARG(int indent));
+
+    // Compute the range for the op1 and op2 for the given binary operator.
+    Range ComputeRangeForBinOp(GenTreeOp* binop DEBUGARG(int indent));
+
+    // Merge assertions from AssertionProp's flags, for the corresponding "phiArg."
+    // Requires "pRange" to contain range that is computed partially.
+    void MergeAssertion(BasicBlock* block, GenTree* phiArg, Range* pRange DEBUGARG(int indent));
+
+    // Inspect the "assertions" and extract assertions about the given "phiArg" and
+    // refine the "pRange" value.
+    void MergeEdgeAssertions(GenTreeLclVarCommon* lcl, ASSERT_VALARG_TP assertions, Range* pRange);
+
+    Range MergePhi(GenTree* expr, bool widen DEBUGARG(int indent));
+
+    // Inspect the assertions about the current ValueNum to refine pRange
+    void MergeEdgeAssertions(ValueNum num, ASSERT_VALARG_TP assertions, Range* pRange);
+
+    // The maximum possible value of the given "limit." If such a value could not be determined
+    // return "false." For example: ARRLEN_MAX for array length.
+    bool GetLimitMax(Limit& limit, int* pMax);
+
+    // Does the addition of the two limits overflow?
+    bool AddOverflows(Limit& limit1, Limit& limit2);
+
+    // Does the binary operation between the operands overflow? Check recursively.
+    bool DoesBinOpOverflow(GenTreeOp* binop);
+
+    // Does the phi operands involve an assignment that could overflow?
+    bool DoesPhiOverflow(GenTree* expr);
+
+    // Find the def of the "expr" local and recurse on the arguments if any of them involve a
+    // calculation that overflows.
+    bool DoesVarDefOverflow(GenTreeLclVarCommon* lcl);
+
+    bool ComputeDoesOverflow(GenTree* expr);
+
+    // Does the current "expr" which is a use involve a definition, that overflows.
+    bool DoesOverflow(GenTree* tree);
+
+    // We allocate a budget to avoid walking long UD chains. When traversing each link in the UD
+    // chain, we decrement the budget. When the budget hits 0, then no more range check optimization
+    // will be applied for the currently compiled method.
+    bool IsOverBudget();
+
+    void SetRange(GenTree* node, const Range& range);
+
+private:
+    // https://msdn.microsoft.com/en-us/windows/apps/hh285054.aspx
+    // CLR throws IDS_EE_ARRAY_DIMENSIONS_EXCEEDED if array length is > INT_MAX.
+    // new byte[INT_MAX]; still throws OutOfMemoryException on my system with 32 GB RAM.
+    // I believe practical limits are still smaller than this number.
+    static const unsigned int ArrLen_Max = 0x7FFFFFFF;
+
+    // Given a lclvar use, try to find the lclvar's defining assignment and its containing block.
+    LclSsaVarDsc* GetSsaDefAsg(GenTreeLclVarCommon* lclUse);
+
+    GenTreeBoundsChk* m_pCurBndsChk;
+
+    // Get the cached overflow values.
+    OverflowMap* GetOverflowMap();
+    OverflowMap* m_pOverflowMap;
+
+    // Get the cached range values.
+    RangeMap* GetRangeMap();
+    RangeMap* m_pRangeMap;
+
+    SearchPath* m_pSearchPath;
+
+#ifdef DEBUG
+    bool         m_fMappedDefs;
+    VarToLocMap* m_pDefTable;
+#endif
+
+    Compiler*     m_pCompiler;
+    CompAllocator m_alloc;
+
+    // The number of nodes for which range is computed throughout the current method.
+    // When this limit is zero, we have exhausted all the budget to walk the ud-chain.
+    int m_nVisitBudget;
+
+    template <typename TVisitor>
+    friend class DefinitionIterator;
+};
+
+template <typename TVisitor>
+class DefinitionIterator : public GenTreeVisitor<TVisitor>
+{
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, short> SearchPath;
+protected:
+    SearchPath* m_pPath;
+    RangeCheck* m_pRangeCheck;
+    short iterNum = 0;
+    int depth = 0; // TODO: debug only
+    bool error = false; // TODO_Better handling?
+    bool widen = false;
+
+    void PostOrderWalkNode(GenTree* node);
+
+public:
+    Compiler::fgWalkResult PreOrderVisit(GenTree** use, GenTree* user)
+    {
+        // TODO: skip subtrees
+        depth++;
+        return Compiler::WALK_CONTINUE;
+    }
+
+    Compiler::fgWalkResult PostOrderVisit(GenTree** use, GenTree* user)
+    {
+        GenTree* node = *use;
+        if (node->IsLocal())
+        {
+            LclSsaVarDsc* ssaDef = m_pRangeCheck->GetSsaDefAsg(node->AsLclVarCommon());
+            if (ssaDef == nullptr)
+            {
+                error = true;
+                return Compiler::WALK_ABORT;
+                // TODO: error
+            }
+            else
+            {
+                ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&ssaDef->GetAssignment()->gtOp2, nullptr);
+            }
+        }
+        else if (user->OperIs(GT_PHI))
+        {
+            for (GenTreePhi::Use& use : user->AsPhi()->Uses())
+            {
+                GenTree* useNode = use.GetNode();
+                //TODO_Nathan: ??
+                ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&useNode, nullptr);
+            }
+        }
+
+        Range range = m_pRangeCheck->ComputeRange(node, widen DEBUGARG(depth));
+        WalkNodeRange(node, range DEBUGARG(depth));
+
+        depth--;
+
+        return Compiler::WALK_CONTINUE;
+    }
+
+    enum
+    {
+        DoPreOrder = true
+    };
+
+    void SetWiden(bool toWiden)
+    {
+        widen = toWiden;
+    }
+
+    void StartWalk(GenTree* node)
+    {
+        //TODO_Nathan: ??
+        ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&node, nullptr);
+        iterNum++;
+    }
+
+    // TODO_Nathan: Better name
+    void WalkNodeRange(GenTree* node, const Range& range DEBUGARG(int indent))
+    {
+        return;
+    }
+
+    DefinitionIterator(RangeCheck* rangeCheck)
+        : GenTreeVisitor<TVisitor>(rangeCheck->m_pCompiler),
+        m_pRangeCheck(rangeCheck)
+    {
+        m_pPath = new (m_pRangeCheck->m_alloc) SearchPath(m_pRangeCheck->m_alloc);
     }
 };

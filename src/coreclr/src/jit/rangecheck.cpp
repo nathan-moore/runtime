@@ -30,6 +30,25 @@ bool RangeCheck::IsOverBudget()
 {
     return (m_nVisitBudget <= 0);
 }
+// Get the range map in which computed ranges are cached.
+RangeCheck::RangeMap* RangeCheck::GetRangeMap()
+{
+    if (m_pRangeMap == nullptr)
+    {
+        m_pRangeMap = new (m_alloc) RangeMap(m_alloc);
+    }
+    return m_pRangeMap;
+}
+
+// Get the overflow map in which computed overflows are cached.
+RangeCheck::OverflowMap* RangeCheck::GetOverflowMap()
+{
+    if (m_pOverflowMap == nullptr)
+    {
+        m_pOverflowMap = new (m_alloc) OverflowMap(m_alloc);
+    }
+    return m_pOverflowMap;
+}
 
 // Get the length of the array vn, if it is new.
 int RangeCheck::GetArrLength(ValueNum vn)
