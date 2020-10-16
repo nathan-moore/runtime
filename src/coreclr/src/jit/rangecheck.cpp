@@ -15,7 +15,6 @@ static const int MAX_VISIT_BUDGET = 8192;
 // RangeCheck constructor.
 RangeCheck::RangeCheck(Compiler* pCompiler)
     : m_pRangeMap(nullptr)
-    , m_pSearchPath(nullptr)
 #ifdef DEBUG
     , m_fMappedDefs(false)
     , m_pDefTable(nullptr)
@@ -24,6 +23,7 @@ RangeCheck::RangeCheck(Compiler* pCompiler)
     , m_alloc(pCompiler->getAllocator(CMK_RangeCheck))
     , m_nVisitBudget(MAX_VISIT_BUDGET)
 {
+    m_pPath = new (m_alloc) SearchPath(m_pRangeCheck->m_alloc);
 }
 
 bool RangeCheck::IsOverBudget()
@@ -314,7 +314,6 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
 
     GetRangeMap()->RemoveAll(); // TODO: remove
     GetOverflowMap()->RemoveAll();
-    m_pSearchPath = new (m_alloc) SearchPath(m_alloc);
 
     NodeWidener widener(this);
     // Compute the range for this index.
@@ -340,7 +339,6 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
     }
 
     JITDUMP("Range value %s\n", range.ToString(m_pCompiler->getAllocatorDebugOnly()));
-    m_pSearchPath->RemoveAll();
 
     // If upper or lower limit is unknown, then return.
     if (range.UpperLimit().IsUnknown() || range.LowerLimit().IsUnknown())
@@ -871,7 +869,7 @@ Range RangeCheck::ComputeRangeForBinOp(GenTreeOp* binop DEBUGARG(int indent))
     // TODO_Nathan: update comment
     Range op2Range = GetRange(op2 DEBUGARG(indent));
 
-    Range r = RangeOps::Add(op1Range, op2Range, this);
+    Range r = RangeOps::Add(op1Range, op2Range);
     JITDUMP("BinOp add ranges %s %s = %s\n", op1Range.ToString(m_pCompiler->getAllocatorDebugOnly()),
             op2Range.ToString(m_pCompiler->getAllocatorDebugOnly()), r.ToString(m_pCompiler->getAllocatorDebugOnly()));
     return r;
@@ -998,12 +996,12 @@ bool RangeCheck::DoesBinOpOverflow(GenTreeOp* binop)
     GenTree* op1 = binop->gtGetOp1();
     GenTree* op2 = binop->gtGetOp2();
 
-    if (!m_pSearchPath->Lookup(op1) && DoesOverflow(op1))
+    if (!IsBeingWalked(op1) && DoesOverflow(op1))
     {
         return true;
     }
 
-    if (!m_pSearchPath->Lookup(op2) && DoesOverflow(op2))
+    if (!IsBeingWalked(op2) && DoesOverflow(op2))
     {
         return true;
     }
@@ -1044,7 +1042,7 @@ bool RangeCheck::DoesPhiOverflow(GenTree* expr)
     for (GenTreePhi::Use& use : expr->AsPhi()->Uses())
     {
         GenTree* arg = use.GetNode();
-        if (m_pSearchPath->Lookup(arg))
+        if (IsBeingWalked(arg))
         {
             continue;
         }
@@ -1073,12 +1071,12 @@ bool RangeCheck::ComputeDoesOverflow(GenTree* expr)
 
     bool overflows = true;
 
-    if (m_pSearchPath->GetCount() > MAX_SEARCH_DEPTH)
+    /*if (m_pSearchPath->GetCount() > MAX_SEARCH_DEPTH) // TODO_Nathan: fixme
     {
         overflows = true;
     }
     // If the definition chain resolves to a constant, it doesn't overflow.
-    else if (m_pCompiler->vnStore->IsVNConstant(expr->gtVNPair.GetConservative()))
+    else */if (m_pCompiler->vnStore->IsVNConstant(expr->gtVNPair.GetConservative()))
     {
         overflows = false;
     }
@@ -1141,21 +1139,20 @@ bool RangeCheck::ComputeDoesOverflow(GenTree* expr)
 Range RangeCheck::ComputeRange(GenTree* expr, bool widen DEBUGARG(int indent))
 {
     //TODO_Nathan: FIXME BB
-    bool  newlyAdded = !m_pSearchPath->Set(expr, nullptr, SearchPath::Overwrite);
     Range range      = Limit(Limit::keUndef);
 
     ValueNum vn = m_pCompiler->vnStore->VNConservativeNormalValue(expr->gtVNPair);
 
     // If we just added 'expr' in the current search path, then reduce the budget.
-    if (newlyAdded)
+    /*if (newlyAdded) //TODO: budget
     {
         // Assert that we are not re-entrant for a node which has been
         // visited and resolved before and not currently on the search path.
         noway_assert(!GetRangeMap()->Lookup(expr));
         m_nVisitBudget--;
-    }
+    }*/
     // Prevent quadratic behavior.
-    if (IsOverBudget())
+    /*if (IsOverBudget())
     {
         // Set to unknown, since an Unknown range resolution, will stop further
         // searches. This is because anything that merges with Unknown will
@@ -1174,7 +1171,7 @@ Range RangeCheck::ComputeRange(GenTree* expr, bool widen DEBUGARG(int indent))
     // for constants. It could use INT64. Still, representing ULONG constants
     // might require preserving the var_type whether it is a un/signed 64-bit.
     // JIT64 doesn't do anything for "long" either. No asm diffs.
-    else if (expr->TypeGet() == TYP_LONG || expr->TypeGet() == TYP_ULONG)
+    else */if (expr->TypeGet() == TYP_LONG || expr->TypeGet() == TYP_ULONG)
     {
         range = Range(Limit(Limit::keUnknown));
         JITDUMP("GetRange long or ulong, setting to unknown value.\n");
@@ -1236,7 +1233,6 @@ Range RangeCheck::ComputeRange(GenTree* expr, bool widen DEBUGARG(int indent))
 
     // TODO_Nathan: proper setting
     // GetRangeMap()->Set(expr, new (m_alloc) Range(range), RangeMap::Overwrite);
-    m_pSearchPath->Remove(expr);
     return range;
 }
 
@@ -1275,7 +1271,7 @@ Range RangeCheck::GetRange(GenTree* expr DEBUGARG(int indent))
     }
     else
     {
-        assert(m_pSearchPath->Lookup(expr));
+        assert(IsBeingWalked(expr));
         range = Range(Limit::keDependent);
         range.SetIsRecursive(true);
     }

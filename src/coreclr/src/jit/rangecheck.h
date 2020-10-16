@@ -59,18 +59,18 @@
 #pragma once
 #include "compiler.h"
 
-    static bool IntAddOverflows(int max1, int max2)
+static bool IntAddOverflows(int max1, int max2)
+{
+    if (max1 > 0 && max2 > 0 && INT_MAX - max1 < max2)
     {
-        if (max1 > 0 && max2 > 0 && INT_MAX - max1 < max2)
-        {
-            return true;
-        }
-        if (max1 < 0 && max2 < 0 && max1 < INT_MIN - max2)
-        {
-            return true;
-        }
-        return false;
+        return true;
     }
+    if (max1 < 0 && max2 < 0 && max1 < INT_MIN - max2)
+    {
+        return true;
+    }
+    return false;
+}
 
 
 struct Limit
@@ -263,13 +263,8 @@ struct RangeOps
         }
     }
 
-    static Limit Add(Limit& l1, Limit& l2, RangeCheck* rc)
+    static Limit Add(Limit& l1, Limit& l2)
     {
-        if (rc->AddOverflows(l1, l2))
-        {
-            return Limit::keDependent;
-        }
-
         if (l1.IsUnknown() || l2.IsUnknown())
         {
             return Limit(Limit::keUnknown);
@@ -297,7 +292,7 @@ struct RangeOps
 
     // Given two ranges "r1" and "r2", perform an add operation on the
     // ranges.
-    static Range Add(Range& r1, Range& r2, RangeCheck* rc)
+    static Range Add(Range& r1, Range& r2)
     {
         Limit& r1lo = r1.LowerLimit();
         Limit& r1hi = r1.UpperLimit();
@@ -306,8 +301,8 @@ struct RangeOps
 
         Range result = Limit(Limit::keUnknown);
 
-        result.lLimit = Add(r1lo, r2lo, rc);
-        result.uLimit = Add(r2lo, r2hi, rc);
+        result.lLimit = Add(r1lo, r2lo);
+        result.uLimit = Add(r2lo, r2hi);
 
         // Either Dependent or Unknown can overflow
         if (result.lLimit.IsDependent() || result.lLimit.IsUnknown())
@@ -507,6 +502,7 @@ struct RangeOps
     }
 };
 
+#define iterNumMask 0xFE
 
 class RangeCheck
 {
@@ -516,7 +512,7 @@ public:
 
     typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, bool>        OverflowMap;
     typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, Range>      RangeMap;
-    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, BasicBlock*> SearchPath;
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, uint8_t> SearchPath;
 
 #ifdef DEBUG
     // TODO-Cleanup: This code has been kept around just to ensure that the SSA data is still
@@ -646,17 +642,24 @@ private:
     // Given a lclvar use, try to find the lclvar's defining assignment and its containing block.
     LclSsaVarDsc* GetSsaDefAsg(GenTreeLclVarCommon* lclUse);
 
+    bool IsBeingWalked(GenTree* node)
+    {
+        uint8_t curNum;
+        return !m_pPath->Lookup(node, &curNum) || ((curNum & iterNumMask) == iterNum);
+    }
+
     GenTreeBoundsChk* m_pCurBndsChk;
 
     // Get the cached overflow values.
     OverflowMap* GetOverflowMap();
-    OverflowMap* m_pOverflowMap;
+    OverflowMap* m_pOverflowMap = nullptr;
+    uint8_t iterNum = 0;
 
     // Get the cached range values.
     RangeMap* GetRangeMap();
     RangeMap* m_pRangeMap;
 
-    SearchPath* m_pSearchPath;
+    SearchPath* m_pPath;
 
 #ifdef DEBUG
     bool         m_fMappedDefs;
@@ -677,11 +680,8 @@ private:
 template <typename TVisitor>
 class DefinitionIterator : public GenTreeVisitor<TVisitor>
 {
-    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, short> SearchPath;
-protected:
-    SearchPath* m_pPath;
+protected:  
     RangeCheck* m_pRangeCheck;
-    short iterNum = 0;
     int depth = 0; // TODO: debug only
     bool error = false; // TODO_Better handling?
     bool widen = false;
@@ -691,9 +691,18 @@ protected:
 public:
     Compiler::fgWalkResult PreOrderVisit(GenTree** use, GenTree* user)
     {
-        // TODO: skip subtrees
         depth++;
-        return Compiler::WALK_CONTINUE;
+        assert((m_pRangeCheck->iterNum & iterNumMask) == m_pRangeCheck->iterNum);
+        uint8_t curNum;
+        if (!m_pRangeCheck->m_pPath->Lookup(*use, &curNum) || ((curNum & iterNumMask) != m_pRangeCheck->iterNum))
+        {
+            m_pRangeCheck->m_pPath->Set(*use, m_pRangeCheck->iterNum);
+            return Compiler::WALK_CONTINUE;
+        }
+        else
+        {
+            return Compiler::WALK_SKIP_SUBTREES;
+        }
     }
 
     Compiler::fgWalkResult PostOrderVisit(GenTree** use, GenTree* user)
@@ -706,10 +715,11 @@ public:
             {
                 error = true;
                 return Compiler::WALK_ABORT;
-                // TODO: error
+                // TODO_Nathan: proper error
             }
             else
             {
+                // TODO_Nathan: Add logging
                 ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&ssaDef->GetAssignment()->gtOp2, nullptr);
             }
         }
@@ -724,8 +734,9 @@ public:
         }
 
         Range range = m_pRangeCheck->ComputeRange(node, widen DEBUGARG(depth));
-        WalkNodeRange(node, range DEBUGARG(depth));
+        reinterpret_cast<TVisitor*>(this)->WalkNodeRange(node, range DEBUGARG(depth));
 
+        m_pRangeCheck->m_pPath->Set(node, m_pRangeCheck->iterNum + 1);
         depth--;
 
         return Compiler::WALK_CONTINUE;
@@ -745,7 +756,7 @@ public:
     {
         //TODO_Nathan: ??
         ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&node, nullptr);
-        iterNum++;
+        m_pRangeCheck->iterNum += 2;
     }
 
     // TODO_Nathan: Better name
@@ -758,6 +769,6 @@ public:
         : GenTreeVisitor<TVisitor>(rangeCheck->m_pCompiler),
         m_pRangeCheck(rangeCheck)
     {
-        m_pPath = new (m_pRangeCheck->m_alloc) SearchPath(m_pRangeCheck->m_alloc);
+        
     }
 };
