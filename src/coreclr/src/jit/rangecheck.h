@@ -59,6 +59,7 @@
 #pragma once
 #include "compiler.h"
 
+// TODO: this really shouldn't be here
 static bool IntAddOverflows(int max1, int max2)
 {
     if (max1 > 0 && max2 > 0 && INT_MAX - max1 < max2)
@@ -72,6 +73,15 @@ static bool IntAddOverflows(int max1, int max2)
     return false;
 }
 
+#ifdef DEBUG
+static void Indent(int indent)
+{
+    for (int i = 0; i < indent; ++i)
+    {
+        JITDUMP("   ");
+    }
+}
+#endif
 
 struct Limit
 {
@@ -94,6 +104,7 @@ struct Limit
 
     Limit(LimitType type) : type(type)
     {
+        assert((type == keUndef) || (type == keDependent) || (type == keUnknown));
     }
 
     Limit(LimitType type, int cns) : cns(cns), vn(ValueNumStore::NoVN), type(type)
@@ -239,7 +250,8 @@ struct Range
     {
         size_t size = 64;
         char*  buf  = alloc.allocate<char>(size);
-        sprintf_s(buf, size, "<%s, %s>", lLimit.ToString(alloc), uLimit.ToString(alloc));
+        sprintf_s(buf, size, "<%s, %s> %s", lLimit.ToString(alloc), uLimit.ToString(alloc), 
+            IsRecursive() ? "Recursive" : "");
         return buf;
     }
 #endif
@@ -302,16 +314,11 @@ struct RangeOps
         Range result = Limit(Limit::keUnknown);
 
         result.lLimit = Add(r1lo, r2lo);
-        result.uLimit = Add(r2lo, r2hi);
+        result.uLimit = Add(r1hi, r2hi);
 
-        // Either Dependent or Unknown can overflow
-        if (result.lLimit.IsDependent() || result.lLimit.IsUnknown())
+        if (r1.IsRecursive() || r2.IsRecursive())
         {
-            result.uLimit = result.lLimit;
-        }
-        else if (result.uLimit.IsDependent() || result.uLimit.IsUnknown())
-        {
-            result.lLimit = result.uLimit;
+            result.SetIsRecursive(true);
         }
 
         return result;
@@ -439,7 +446,7 @@ struct RangeOps
             int rhsConstant = rhs.GetConstant();
             int lhsConstant = lhs.GetConstant();
             assert(rhsConstant != lhsConstant);
-            if (rhsConstant < lhsConstant)
+            if (lhsConstant < rhsConstant)
             {
                 return LessThen;
             }
@@ -460,7 +467,7 @@ struct RangeOps
             int lhsOffset = lhs.GetConstant();
 
             assert(rhsOffset != lhsOffset);
-            if (rhsOffset < lhsOffset)
+            if (lhsOffset < rhsOffset)
             {
                 return LessThen;
             }
@@ -480,9 +487,9 @@ struct RangeOps
             // This is correct if k >= 0 and n >= k, since a.len always >= 0
             // (a.len + n) could overflow, but we account for that elsewhere
             // and it should be turned into the appropriete bound
-            if (rhsOffset > lhsConstant)
+            if (lhsConstant < rhsOffset)
             {
-                return GreaterThen; // TODO_Nathan: potential CQ loss here, as we don't handle >=
+                return LessThen; // TODO_Nathan: potential CQ loss here, as we don't handle >=
             }
         }
         else if (rhs.IsConstant() && lhs.IsBinOpArray())
@@ -492,9 +499,9 @@ struct RangeOps
             int lhsOffset = lhs.GetConstant();
             int rhsConstant = rhs.GetConstant();
 
-            if (rhsConstant < lhsOffset)
+            if (lhsOffset > rhsConstant)
             {
-                return LessThen; // TODO_Nathan: potential CQ loss here, as we don't handle >=
+                return GreaterThen; // TODO_Nathan: potential CQ loss here, as we don't handle >=
             }
         }
 
@@ -680,27 +687,56 @@ private:
 template <typename TVisitor>
 class DefinitionIterator : public GenTreeVisitor<TVisitor>
 {
-protected:  
+protected: 
+    // TODO_Nathan: These should be as stateless as possible, so we can do things like looking for the range of phis in assertions
+    // in the future. 
     RangeCheck* m_pRangeCheck;
-    int depth = 0; // TODO: debug only
-    bool error = false; // TODO_Better handling?
-    bool widen = false;
+    int depth = -1; // TODO_Nathan: debug only
+    bool error = false; // TODO_Nathan: Better handling?
+    bool skipRecursivePhis = false;
+    bool skipTree = false;
+    ArrayStack<BasicBlock*>* basicBlocks; // TODO_Nathan: If it matters, this is re-allocated every walker. This is fine, but
+    // it might be better to just store it in range check
 
     void PostOrderWalkNode(GenTree* node);
 
+    bool WalkTree(GenTree* tree)
+    {
+        uint8_t curNum;
+        return !m_pRangeCheck->m_pPath->Lookup(tree, &curNum) || ((curNum & iterNumMask) != m_pRangeCheck->iterNum);
+    }
 public:
     Compiler::fgWalkResult PreOrderVisit(GenTree** use, GenTree* user)
     {
         depth++;
-        assert((m_pRangeCheck->iterNum & iterNumMask) == m_pRangeCheck->iterNum);
-        uint8_t curNum;
-        if (!m_pRangeCheck->m_pPath->Lookup(*use, &curNum) || ((curNum & iterNumMask) != m_pRangeCheck->iterNum))
+        GenTree* expr = *use;
+#ifdef DEBUG
+        if (m_pRangeCheck->m_pCompiler->verbose)
         {
-            m_pRangeCheck->m_pPath->Set(*use, m_pRangeCheck->iterNum);
+            Indent(depth);
+            JITDUMP("[RangeCheck::PreOrderVisit]\n");
+            m_pRangeCheck->m_pCompiler->gtDispTree(expr);
+            Indent(depth);
+        }
+#endif
+        assert((m_pRangeCheck->iterNum & iterNumMask) == m_pRangeCheck->iterNum);
+        if (WalkTree(expr))
+        {
+#ifdef DEBUG
+            if (m_pRangeCheck->m_pCompiler->verbose)
+            {
+                JITDUMP("Walking node's subtree\n");
+                Indent(depth);
+                JITDUMP("{\n")
+            }
+#endif
+            m_pRangeCheck->m_pPath->Set(expr, m_pRangeCheck->iterNum, RangeCheck::SearchPath::Overwrite);
             return Compiler::WALK_CONTINUE;
         }
         else
         {
+            JITDUMP("Skipping node's subtree\n")
+            skipTree = true;
             return Compiler::WALK_SKIP_SUBTREES;
         }
     }
@@ -708,35 +744,51 @@ public:
     Compiler::fgWalkResult PostOrderVisit(GenTree** use, GenTree* user)
     {
         GenTree* node = *use;
-        if (node->IsLocal())
+        if (skipTree)
+        {
+            depth--;
+            skipTree = false;
+            return Compiler::WALK_CONTINUE;
+        }
+        else if (node->IsLocal())
         {
             LclSsaVarDsc* ssaDef = m_pRangeCheck->GetSsaDefAsg(node->AsLclVarCommon());
             if (ssaDef == nullptr)
             {
-                error = true;
-                return Compiler::WALK_ABORT;
+                JITDUMP("Could not get ssa def for local\n");
+                m_pRangeCheck->SetRange(node, Range(Limit::keUnknown));
+                return Compiler::WALK_CONTINUE;
                 // TODO_Nathan: proper error
             }
             else
             {
                 // TODO_Nathan: Add logging
-                ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&ssaDef->GetAssignment()->gtOp2, nullptr);
-            }
-        }
-        else if (user->OperIs(GT_PHI))
-        {
-            for (GenTreePhi::Use& use : user->AsPhi()->Uses())
-            {
-                GenTree* useNode = use.GetNode();
-                //TODO_Nathan: ??
-                ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&useNode, nullptr);
+                basicBlocks->Push(ssaDef->GetBlock());
+                GenTree* assigner = ssaDef->GetAssignment()->gtOp2;
+                ((GenTreeVisitor<TVisitor>*)this)->WalkTree(&assigner, nullptr);
+                basicBlocks->Pop();
+                // TODO_Nathan: printing is probably bad
+                m_pRangeCheck->SetRange(node, m_pRangeCheck->GetRange(assigner DEBUGARG(depth)));
             }
         }
 
-        Range range = m_pRangeCheck->ComputeRange(node, widen DEBUGARG(depth));
+        Range range = m_pRangeCheck->ComputeRange(node, skipRecursivePhis DEBUGARG(depth));
         reinterpret_cast<TVisitor*>(this)->WalkNodeRange(node, range DEBUGARG(depth));
 
-        m_pRangeCheck->m_pPath->Set(node, m_pRangeCheck->iterNum + 1);
+        m_pRangeCheck->m_pPath->Set(node, m_pRangeCheck->iterNum + 1, RangeCheck::SearchPathW::Overwrite);
+
+#ifdef DEBUG
+        if (m_pRangeCheck->m_pCompiler->verbose)
+        {
+            range = m_pRangeCheck->GetRange(node DEBUGARG(0));
+            Indent(depth);
+            JITDUMP("Range [%06d] => %s\n", Compiler::dspTreeID(node),
+                    range.ToString(m_pRangeCheck->m_pCompiler->getAllocatorDebugOnly()));
+            Indent(depth);
+            JITDUMP("}\n", node);
+        }
+#endif
+
         depth--;
 
         return Compiler::WALK_CONTINUE;
@@ -744,12 +796,13 @@ public:
 
     enum
     {
-        DoPreOrder = true
+        DoPreOrder = true,
+        DoPostOrder = true
     };
 
-    void SetWiden(bool toWiden)
+    void SetSkipRecursivePhis(bool skipRecPhis)
     {
-        widen = toWiden;
+        skipRecursivePhis = skipRecPhis;
     }
 
     void StartWalk(GenTree* node)
@@ -765,10 +818,15 @@ public:
         return;
     }
 
+    bool IsErrorState()
+    {
+        return error;
+    }
+
     DefinitionIterator(RangeCheck* rangeCheck)
         : GenTreeVisitor<TVisitor>(rangeCheck->m_pCompiler),
         m_pRangeCheck(rangeCheck)
     {
-        
+        basicBlocks = new(rangeCheck->m_alloc) ArrayStack<BasicBlock*>(rangeCheck->m_alloc);
     }
 };

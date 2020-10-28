@@ -23,7 +23,7 @@ RangeCheck::RangeCheck(Compiler* pCompiler)
     , m_alloc(pCompiler->getAllocator(CMK_RangeCheck))
     , m_nVisitBudget(MAX_VISIT_BUDGET)
 {
-    m_pPath = new (m_alloc) SearchPath(m_pRangeCheck->m_alloc);
+    m_pPath = new (m_alloc) SearchPath(m_alloc);
 }
 
 bool RangeCheck::IsOverBudget()
@@ -192,16 +192,16 @@ public:
     void WalkNodeRange(GenTree* node, const Range& range DEBUGARG(int indent))
     {
         Range newRange(Limit::keUnknown);
-        if (widen)
+        if (!skipRecursivePhis) // we want to widen when not skipping recursive phis for this walker
         {
             Range oldRange = m_pRangeCheck->GetRange(node DEBUGARG(indent));
-            if (oldRange.IsRecursive())
+
+            if (!node->OperIs(GT_PHI))
             {
                 newRange = range;
             }
             else
             {
-                assert(!newRange.IsRecursive());
                 RangeOps::CompareResults lower = RangeOps::CompareLimit(range.lLimit, oldRange.lLimit);
                 RangeOps::CompareResults upper = RangeOps::CompareLimit(range.uLimit, oldRange.uLimit);
 
@@ -229,6 +229,31 @@ public:
             newRange = range;
         }
 
+        m_pRangeCheck->SetRange(node, newRange);
+    }
+};
+
+class NodeNarrower : public DefinitionIterator<NodeNarrower>
+{
+public:
+    NodeNarrower(RangeCheck* rangeCheck, BasicBlock* bb) 
+        : DefinitionIterator<NodeNarrower>(rangeCheck)
+    {
+        basicBlocks->Push(bb);
+    }
+
+    void WalkNodeRange(GenTree* node, const Range& range DEBUGARG(int indent))
+    {
+        // TODO_Nathan: the range within recursive loops should be correct due to merging assertions from top down, and
+        // the range after loops should be right due to phis after recursive loops
+        // I should make sure that there are test cases for both of these cases though.
+        Range newRange = range;
+        if (node->IsLocal() || node->OperIs(GT_PHI)) // TODO_Nathan: this is what it used. See if Phis are really necessary
+        {
+            m_pRangeCheck->MergeAssertion(basicBlocks->Top(), node, &newRange DEBUGARG(indent));
+        }
+
+        // set the range in case we improved a node upstream
         m_pRangeCheck->SetRange(node, newRange);
     }
 };
@@ -314,10 +339,18 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
 
     GetRangeMap()->RemoveAll(); // TODO: remove
     GetOverflowMap()->RemoveAll();
+    m_pRangeMap->RemoveAll(); // TODO: remove
 
     NodeWidener widener(this);
+    widener.SetSkipRecursivePhis(true);
     // Compute the range for this index.
     widener.StartWalk(treeIndex);
+
+    if (widener.IsErrorState())
+    {
+        JITDUMP("Error in NodeWidener. Bailing removing range check\n");
+        return;
+    }
 
     // TODO_Nathan: this will double print?
     Range range = GetRange(treeIndex DEBUGARG(0));
@@ -332,10 +365,11 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
     }
     else if (range.IsRecursive())
     {
-        widener.SetWiden(true);
+        widener.SetSkipRecursivePhis(false); // TODO: JITDUMP
         widener.StartWalk(treeIndex);
         range = GetRange(treeIndex DEBUGARG(0));
-        assert(!range.IsRecursive());
+        //assert(!range.IsRecursive());
+        assert(!widener.IsErrorState() && "Should not error after initial walk succeeded");
     }
 
     JITDUMP("Range value %s\n", range.ToString(m_pCompiler->getAllocatorDebugOnly()));
@@ -347,13 +381,17 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
     }
 
     // TODO: narrowing
+    NodeNarrower narrower(this, block);
+    narrower.StartWalk(treeIndex);
+    assert(!narrower.IsErrorState());
+
     // TODO: enable overflow
     if (false && DoesOverflow(treeIndex))
     {
         JITDUMP("Method determined to overflow\n");
         return;
     }
-
+    range = GetRange(treeIndex DEBUGARG(0));
     // Is the range between the lower and upper bound values.
     if (BetweenBounds(range, bndsChk->gtArrLen, arrSize))
     {
@@ -591,7 +629,7 @@ void RangeCheck::MergeEdgeAssertions(ValueNum normalLclVN, ASSERT_VALARG_TP asse
             cmpOper = (genTreeOps)info.cmpOper;
         }
         // Current assertion is of the form i == 100
-        else if (curAssertion->IsConstantInt32Assertion())
+        else if (curAssertion->IsConstantInt32Assertion() && (curAssertion->op2.vn != 0)) // TODO_Nathan: ?
         {
             if (curAssertion->op1.vn != normalLclVN)
             {
@@ -892,6 +930,7 @@ Range RangeCheck::ComputeRangeForLocalDef(GenTreeLclVarCommon* lcl
         JITDUMP("----------------------------------------------------\n");
     }
 #endif
+    // TODO_Nathan: shouldn't be necessary
     Range range = GetRange(ssaDef->GetAssignment()->gtGetOp2() DEBUGARG(indent));
     /*
     if (!BitVecOps::MayBeUninit(block->bbAssertionIn) && (m_pCompiler->GetAssertionCount() > 0))
@@ -906,29 +945,39 @@ Range RangeCheck::ComputeRangeForLocalDef(GenTreeLclVarCommon* lcl
     return range;
 }
 
-Range RangeCheck::MergePhi(GenTree* expr, bool widen DEBUGARG(int indent))
+Range RangeCheck::MergePhi(GenTree* expr, bool skipRecursivePhis DEBUGARG(int indent))
 {
-    Range range = Limit(Limit::keUnknown);
+    Range range = Limit(Limit::keUndef);
     for (GenTreePhi::Use& use : expr->AsPhi()->Uses())
     {
         Range argRange = GetRange(use.GetNode() DEBUGARG(indent));
 
-        if (widen)
+        // TODO_Nathan: currently we use Dependent on recursive phis. It may make sense to use a special 
+        // type
+        // We don't skip recursive phis if they have actual data in them
+        if (skipRecursivePhis && argRange.IsRecursive() && argRange.lLimit.IsDependent() && argRange.uLimit.IsDependent())
         {
-            assert(!argRange.IsRecursive());
-        }
-        else if (argRange.IsRecursive())
-        {
-            JITDUMP("Skipping recursive phi use\n")
+            JITDUMP("Skipping recursive phi use\n");
+            range.SetIsRecursive(true);
             continue;
         }
 
-        assert(!argRange.LowerLimit().IsUndef());
-        assert(!argRange.UpperLimit().IsUndef());
         JITDUMP("Merging ranges %s %s:", range.ToString(m_pCompiler->getAllocatorDebugOnly()),
                 argRange.ToString(m_pCompiler->getAllocatorDebugOnly()));
+        assert(!argRange.LowerLimit().IsUndef());
+        assert(!argRange.UpperLimit().IsUndef());
         range = RangeOps::Merge(range, argRange);
         JITDUMP("%s\n", range.ToString(m_pCompiler->getAllocatorDebugOnly()));
+    }
+
+    if (range.LowerLimit().IsUndef() || range.UpperLimit().IsUndef())
+    {
+        assert(range.IsRecursive());
+        if (range.LowerLimit().IsUndef())
+            range.lLimit = Limit::keDependent;
+        
+        if (range.UpperLimit().IsUndef())
+            range.uLimit = Limit::keDependent;
     }
 
     return range;
@@ -1136,7 +1185,7 @@ bool RangeCheck::ComputeDoesOverflow(GenTree* expr)
 //   while merging phi node. eg.: merge((0, dep), (dep, dep)) = (0, dep),
 //   merge((0, 1), (dep, dep)) = (0, dep), merge((0, 5), (dep, 10)) = (0, 10).
 //
-Range RangeCheck::ComputeRange(GenTree* expr, bool widen DEBUGARG(int indent))
+Range RangeCheck::ComputeRange(GenTree* expr, bool skipRecursivePhis DEBUGARG(int indent))
 {
     //TODO_Nathan: FIXME BB
     Range range      = Limit(Limit::keUndef);
@@ -1196,7 +1245,7 @@ Range RangeCheck::ComputeRange(GenTree* expr, bool widen DEBUGARG(int indent))
     // If phi, then compute the range for arguments, calling the result "dependent" when looping begins.
     else if (expr->OperGet() == GT_PHI)
     {
-        range = MergePhi(expr, widen DEBUGARG(indent + 1));
+        range = MergePhi(expr, skipRecursivePhis DEBUGARG(indent + 1));
     }
     else if (varTypeIsSmallInt(expr->TypeGet()))
     {
@@ -1236,56 +1285,28 @@ Range RangeCheck::ComputeRange(GenTree* expr, bool widen DEBUGARG(int indent))
     return range;
 }
 
-#ifdef DEBUG
-void Indent(int indent)
-{
-    for (int i = 0; i < indent; ++i)
-    {
-        JITDUMP("   ");
-    }
-}
-#endif
-
 // TODO_Nathan: Standard comment header
 // Get the range, if it is already computed, use the cached range value, 
 // else it is currently being computed. If so, then do stuff
 Range RangeCheck::GetRange(GenTree* expr DEBUGARG(int indent))
 {
-#ifdef DEBUG
-    if (m_pCompiler->verbose)
-    {
-        Indent(indent);
-        JITDUMP("[RangeCheck::GetRange] ");
-        m_pCompiler->gtDispTree(expr);
-        Indent(indent);
-        JITDUMP("{\n", expr);
-    }
-#endif
-
     Range* pRange = nullptr; // TODO_Nathan: fix dumping
     Range  range(Limit::keUnknown);
 
-    if (GetRangeMap()->Lookup(expr, &range))
+    if (!GetRangeMap()->Lookup(expr, &range))
     {
-
-    }
-    else
-    {
+#ifdef DEBUG
+        if (m_pCompiler->verbose)
+        {
+            JITDUMP("Recursive dependency on ");
+            m_pCompiler->gtDispTree(expr);
+        }
+#endif  
         assert(IsBeingWalked(expr));
         range = Range(Limit::keDependent);
         range.SetIsRecursive(true);
     }
 
-#ifdef DEBUG
-    if (m_pCompiler->verbose)
-    {
-        Indent(indent);
-        JITDUMP("   %s Range [%06d] => %s\n", (pRange == nullptr) ? "Computed" : "Cached", Compiler::dspTreeID(expr),
-                range.ToString(m_pCompiler->getAllocatorDebugOnly()));
-        Indent(indent);
-        JITDUMP("}\n", expr);
-    }
-#endif
     return range;
 }
 
