@@ -355,15 +355,16 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
     // TODO_Nathan: this will double print?
     Range range = GetRange(treeIndex DEBUGARG(0));
 
+    // In some cases we can get around unkown due to assertions/narrowing. We need a different mechanism to identify overflow
     // If upper or lower limit is found to be unknown, or it was found to
     // be unknown because of over budget or a deep search, then return early.
-    if (range.UpperLimit().IsUnknown() || range.LowerLimit().IsUnknown())
+    /*if (range.UpperLimit().IsUnknown() || range.LowerLimit().IsUnknown())
     {
         // Note: If we had stack depth too deep in the GetRange call, we'd be
         // too deep even in the DoesOverflow call. So return early.
         return;
     }
-    else if (range.IsRecursive())
+    else*/ if (range.IsRecursive())
     {
         widener.SetSkipRecursivePhis(false); // TODO: JITDUMP
         widener.StartWalk(treeIndex);
@@ -373,17 +374,18 @@ void RangeCheck::OptimizeRangeCheck(BasicBlock* block, Statement* stmt, GenTree*
     }
 
     JITDUMP("Range value %s\n", range.ToString(m_pCompiler->getAllocatorDebugOnly()));
-
-    // If upper or lower limit is unknown, then return.
-    if (range.UpperLimit().IsUnknown() || range.LowerLimit().IsUnknown())
-    {
-        return;
-    }
-
+    
     // TODO: narrowing
     NodeNarrower narrower(this, block);
     narrower.StartWalk(treeIndex);
     assert(!narrower.IsErrorState());
+
+    range = GetRange(treeIndex DEBUGARG(0));
+    if (range.UpperLimit().IsUnknown() || range.LowerLimit().IsUnknown())
+    {
+        JITDUMP("Not removing range check due to unkowns after lowering\n");
+        return;
+    }
 
     // TODO: enable overflow
     if (false && DoesOverflow(treeIndex))
