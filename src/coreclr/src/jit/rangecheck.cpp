@@ -395,16 +395,25 @@ bool RangeCheck::IsMonotonicallyIncreasing(GenTree* expr, bool rejectNegativeCon
     // If expr is constant, then it is not part of the dependency
     // loop which has to increase monotonically.
     ValueNum vn = expr->gtVNPair.GetConservative();
-    if (m_pCompiler->vnStore->IsVNInt32Constant(vn))
+    if (m_pCompiler->vnStore->IsVNConstant(vn))
     {
-        if (rejectNegativeConst)
+        if (!rejectNegativeConst)
+        {
+            return true;
+        }
+
+        var_types type = m_pCompiler->vnStore->TypeOfVN(vn);
+
+        if (type == TYP_INT)
         {
             int cons = m_pCompiler->vnStore->ConstantValue<int>(vn);
             return (cons >= 0);
         }
         else
         {
-            return true;
+            assert(type == TYP_LONG);
+            INT64 cons = m_pCompiler->vnStore->ConstantValue<INT64>(vn);
+            return (cons >= 0);
         }
     }
     // If the rhs expr is local, then try to find the def of the local.
@@ -1261,21 +1270,35 @@ Range RangeCheck::ComputeRange(BasicBlock* block, GenTree* expr, bool monIncreas
         range = Range(Limit(Limit::keUnknown));
         JITDUMP("GetRange not tractable within max stack depth.\n");
     }
-    // TODO-CQ: The current implementation is reliant on integer storage types
-    // for constants. It could use INT64. Still, representing ULONG constants
-    // might require preserving the var_type whether it is a un/signed 64-bit.
-    // JIT64 doesn't do anything for "long" either. No asm diffs.
-    else if (expr->TypeGet() == TYP_LONG || expr->TypeGet() == TYP_ULONG)
-    {
-        range = Range(Limit(Limit::keUnknown));
-        JITDUMP("GetRange long or ulong, setting to unknown value.\n");
-    }
     // If VN is constant return range as constant.
     else if (m_pCompiler->vnStore->IsVNConstant(vn))
     {
-        range = (m_pCompiler->vnStore->TypeOfVN(vn) == TYP_INT)
-                    ? Range(Limit(Limit::keConstant, m_pCompiler->vnStore->ConstantValue<int>(vn)))
-                    : Limit(Limit::keUnknown);
+        // TODO-CQ: The current implementation is reliant on integer storage types
+        // for constants. It could use INT64. Still, representing ULONG constants
+        // might require preserving the var_type whether it is a un/signed 64-bit.
+        // To get around this, we only get the range of constants that fit into an
+        // int, as that will consertively handle them.
+        var_types type = m_pCompiler->vnStore->TypeOfVN(vn);
+        if (type == TYP_INT)
+        {
+            range = Range(Limit(Limit::keConstant, m_pCompiler->vnStore->ConstantValue<int>(vn)));
+        }
+        else if (type == TYP_LONG)
+        {
+            INT64 cons = m_pCompiler->vnStore->ConstantValue<INT64>(vn);
+            if ((int)cons == cons)
+            {
+                range = Range(Limit(Limit::keConstant, (int)cons));
+            }
+            else
+            {
+                range = Range(Limit(Limit::keUnknown));
+            }
+        }
+        else
+        {
+            range = Limit(Limit::keUnknown);
+        }
     }
     // If local, find the definition from the def map and evaluate the range for rhs.
     else if (expr->IsLocal())
